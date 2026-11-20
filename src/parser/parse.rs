@@ -14,16 +14,89 @@
 
 use crate::parser::{lex, Expr, INVALID_QUERY_INFO};
 
-/// Parse the given query literal to an AST (which is [`Expr`] in this crate).
+/// Experimental PromQL syntax, each off by default as in Prometheus.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ParseOptions {
+    /// Duration expressions in ranges, subquery steps and offsets
+    /// (`foo[5m + 1m]`, `foo offset (2 * 1h)`, `foo[step()]`): Prometheus's
+    /// `--enable-feature=promql-duration-expr`.
+    pub duration_expr: bool,
+    /// The `anchored` and `smoothed` selector modifiers: Prometheus's
+    /// `--enable-feature=promql-extended-range-selectors`.
+    pub extended_range_selectors: bool,
+}
+
+impl ParseOptions {
+    /// Every experimental syntax enabled.
+    pub fn all() -> Self {
+        ParseOptions {
+            duration_expr: true,
+            extended_range_selectors: true,
+        }
+    }
+}
+
+/// Parse the given query literal to an AST (which is [`Expr`] in this crate),
+/// with the default [`ParseOptions`] (no experimental syntax).
 pub fn parse(input: &str) -> Result<Expr, String> {
-    match lex::lexer(input) {
-        Err(e) => Err(e),
+    parse_with_options(input, &ParseOptions::default())
+}
+
+/// Parse the given query literal to an AST with the given options.
+///
+/// Duration expressions that do not use `step()` are resolved here: their
+/// value is set in the range, step or offset they stand for. Those that do
+/// keep a zero value until [`Expr::resolve_durations`] is called with the
+/// query's step.
+pub fn parse_with_options(input: &str, opts: &ParseOptions) -> Result<Expr, String> {
+    let mut expr = match lex::lexer(input) {
+        Err(e) => return Err(e),
         Ok(lexer) => {
             // NOTE: the errs is ignored so far.
             let (res, _errs) = crate::promql_y::parse(&lexer);
-            res.ok_or_else(|| String::from(INVALID_QUERY_INFO))?
+            res.ok_or_else(|| String::from(INVALID_QUERY_INFO))??
         }
-    }
+    };
+    check_options(&expr, opts)?;
+    expr.resolve_durations_inner(None)?;
+    Ok(expr)
+}
+
+/// Refuse the syntax `opts` does not enable, with Prometheus's messages.
+fn check_options(expr: &Expr, opts: &ParseOptions) -> Result<(), String> {
+    const DURATION_OFF: &str = "experimental duration expression is not enabled";
+    let duration = |e: &Option<_>| {
+        if e.is_some() && !opts.duration_expr {
+            Err(String::from(DURATION_OFF))
+        } else {
+            Ok(())
+        }
+    };
+    let selector = |vs: &crate::parser::VectorSelector| {
+        duration(&vs.offset_expr)?;
+        if !opts.extended_range_selectors {
+            if vs.anchored {
+                return Err(String::from("anchored modifier is experimental and not enabled"));
+            }
+            if vs.smoothed {
+                return Err(String::from("smoothed modifier is experimental and not enabled"));
+            }
+        }
+        Ok(())
+    };
+    expr.for_each_node(&mut |e| match e {
+        Expr::VectorSelector(vs) => selector(vs),
+        Expr::MatrixSelector(ms) => {
+            duration(&ms.range_expr)?;
+            selector(&ms.vs)
+        }
+        Expr::Subquery(sq) => {
+            duration(&sq.range_expr)?;
+            duration(&sq.step_expr)?;
+            duration(&sq.offset_expr)
+        }
+        _ => Ok(()),
+    })
 }
 
 /// cases in original prometheus is a huge slices which are constructed more than 3000 lines,
@@ -2524,5 +2597,216 @@ mod tests {
         let case = r#"test{host=~"10\\.0\\.160\\.237:808|nonexistence"}"#;
         parser::parse(case).unwrap();
         assert!(parser::parse(case).is_ok());
+    }
+
+    fn parse_all(q: &str) -> Result<Expr, String> {
+        parser::parse_with_options(q, &parser::ParseOptions::all())
+    }
+
+    fn range_secs(e: &Expr) -> f64 {
+        match e {
+            Expr::Call(c) => range_secs(&c.args.args[0]),
+            Expr::MatrixSelector(ms) => ms.range.as_secs_f64(),
+            Expr::Subquery(sq) => sq.range.as_secs_f64(),
+            e => panic!("no range in {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_duration_expr_ranges() {
+        for q in [
+            "foo[26m+4m]",
+            "foo[30m+0s]",
+            "foo[1800]",
+            "foo[60*30]",
+            "foo[2m*15]",
+            "foo[2m*(10+5)]",
+            "foo[29m+60s]",
+            "foo[24m+((1.5*2m)+2m)]",
+            "foo[-5m+35m]",
+            "foo[1h/2]",
+            "foo[1h30m % 1h]",
+            "foo[30m1s-30m1s % 1m]",
+            "foo[(9m30s+30s)*3]",
+            "changes(foo[ 2 ^ 2 * 450 ])",
+        ] {
+            let e = parse_all(q).unwrap_or_else(|err| panic!("{q}: {err}"));
+            assert_eq!(range_secs(&e), 1800.0, "{q}");
+        }
+        // A plain literal is not an expression.
+        match parse_all("foo[30m]").unwrap() {
+            Expr::MatrixSelector(ms) => assert!(ms.range_expr.is_none()),
+            e => panic!("{e:?}"),
+        }
+        // Subquery range and step.
+        match parse_all("foo[29s+1s:((((8 - 2) / 3) * 7s) % 4) + 8000ms]").unwrap() {
+            Expr::Subquery(sq) => {
+                assert_eq!(sq.range, Duration::from_secs(30));
+                assert_eq!(sq.step, Some(Duration::from_secs(10)));
+            }
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_duration_expr_step() {
+        let mut e = parse_all("count_over_time(foo[1+(STep()-5)*2])").unwrap();
+        e.resolve_durations(Duration::from_secs(10)).unwrap();
+        assert_eq!(range_secs(&e), 11.0);
+        let mut e = parse_all("foo[max(min(step()+1,1h),1ms)]").unwrap();
+        e.resolve_durations(Duration::from_secs(5)).unwrap();
+        assert_eq!(range_secs(&e), 6.0);
+        // step() of an instant query is 0: not a valid range.
+        let mut e = parse_all("foo[step()]").unwrap();
+        assert!(e.resolve_durations(Duration::ZERO).is_err());
+        assert!(parse_all("foo[1m/0]").is_err());
+        assert!(parse_all("foo[1m % 0]").is_err());
+        assert!(parse_all("foo[1m-2m]").is_err());
+        assert!(parse_all("foo[now()]").is_err());
+        assert!(parse_all("foo[(1m]").is_err());
+        assert!(parse_all("foo[1m)]").is_err());
+    }
+
+    fn offset_of(e: &Expr) -> Option<Offset> {
+        match e {
+            Expr::VectorSelector(vs) => vs.offset.clone(),
+            Expr::MatrixSelector(ms) => ms.vs.offset.clone(),
+            Expr::Subquery(sq) => sq.offset.clone(),
+            Expr::Call(c) => offset_of(&c.args.args[0]),
+            e => panic!("no offset in {e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_duration_expr_offsets() {
+        let pos = |s| Some(Offset::Pos(Duration::from_secs(s)));
+        let neg = |s| Some(Offset::Neg(Duration::from_secs(s)));
+        for (q, want) in [
+            ("foo offset (100 + 2)", pos(102)),
+            ("foo offset (2 ^ 2)", pos(4)),
+            ("foo offset (2 * 2)", pos(4)),
+            ("foo offset (-2 * 2)", neg(4)),
+            ("foo offset (-2 ^ 2)", neg(4)),
+            ("foo offset -(2 ^ 2)", neg(4)),
+            ("foo offset min(5m, 1s)", pos(1)),
+            ("foo offset +max(5m, 1s)", pos(300)),
+            ("foo[1m:] offset (20*(((((8 - 2) / 3) * 7s) % 4) + 8000ms))", pos(200)),
+            ("foo[1m:] offset -(20*(((((8 - 2) / 3) * 7s) % 4) + 8000ms))", neg(200)),
+        ] {
+            let e = parse_all(q).unwrap_or_else(|err| panic!("{q}: {err}"));
+            assert_eq!(offset_of(&e), want, "{q}");
+        }
+        // An offset binds tighter than any binary operator.
+        for q in [
+            "foo offset 100 + 2",
+            "foo offset 2 ^ 2",
+            "foo offset -2 * 2",
+            "foo offset step()*0",
+            "foo offset -min(step(), 1s)^0",
+            "foo offset max(3s,min(step(), 1s))+8000",
+        ] {
+            match parse_all(q).unwrap_or_else(|err| panic!("{q}: {err}")) {
+                Expr::Binary(_) => {}
+                e => panic!("{q}: {e:?}"),
+            }
+        }
+        let mut e = parse_all("foo offset -step()").unwrap();
+        e.resolve_durations(Duration::from_secs(5)).unwrap();
+        assert_eq!(offset_of(&e), neg(5));
+        // A signed literal stays a plain offset without the feature.
+        assert_eq!(
+            offset_of(&parser::parse("foo offset -5m").unwrap()),
+            neg(300)
+        );
+    }
+
+    #[test]
+    fn test_duration_expr_disabled() {
+        for q in [
+            "foo[5m+1m]",
+            "foo[(5m)]",
+            "foo[step()]",
+            "foo[1m:step()]",
+            "foo[1m:30s+30s]",
+            "foo offset (1m)",
+            "foo offset step()",
+            "foo offset -min(1m, 2m)",
+            "foo[5m] offset (1m * 2)",
+            "foo[5m:] offset (1m * 2)",
+        ] {
+            assert_eq!(
+                parser::parse(q),
+                Err("experimental duration expression is not enabled".into()),
+                "{q}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_anchored_smoothed() {
+        for (q, anchored, smoothed) in [
+            ("increase(foo[1m] anchored)", true, false),
+            ("increase(foo[1m] smoothed)", false, true),
+            ("foo smoothed", false, true),
+            ("foo anchored", true, false),
+            ("foo[1m] ANCHORED offset 1m", true, false),
+        ] {
+            let e = parse_all(q).unwrap_or_else(|err| panic!("{q}: {err}"));
+            let vs = match &e {
+                Expr::Call(c) => match &*c.args.args[0] {
+                    Expr::MatrixSelector(ms) => ms.vs.clone(),
+                    e => panic!("{e:?}"),
+                },
+                Expr::MatrixSelector(ms) => ms.vs.clone(),
+                Expr::VectorSelector(vs) => vs.clone(),
+                e => panic!("{e:?}"),
+            };
+            assert_eq!((vs.anchored, vs.smoothed), (anchored, smoothed), "{q}");
+            // Display round-trips.
+            assert_eq!(parse_all(&e.to_string()).unwrap(), e, "{q} -> {e}");
+        }
+        assert_eq!(
+            parse_all("foo[1m] anchored smoothed"),
+            Err("anchored and smoothed modifiers cannot be used together".into())
+        );
+        assert_eq!(
+            parse_all("foo[1m:] anchored"),
+            Err("anchored modifier is not supported for subqueries".into())
+        );
+        assert!(parse_all("(foo) smoothed").is_err());
+        assert_eq!(
+            parser::parse("foo[1m] anchored"),
+            Err("anchored modifier is experimental and not enabled".into())
+        );
+        assert_eq!(
+            parser::parse("foo smoothed"),
+            Err("smoothed modifier is experimental and not enabled".into())
+        );
+        // Still metric and label names.
+        assert_eq!(
+            parser::parse("anchored"),
+            Ok(Expr::from(VectorSelector::from("anchored")))
+        );
+        assert!(parser::parse("sum by (smoothed) (anchored)").is_ok());
+        // `a + b smoothed` binds the modifier to b.
+        match parse_all("a + b smoothed").unwrap() {
+            Expr::Binary(b) => assert!(matches!(&*b.rhs, Expr::VectorSelector(vs) if vs.smoothed)),
+            e => panic!("{e:?}"),
+        }
+    }
+
+    #[test]
+    fn test_duration_expr_display() {
+        for q in [
+            "foo[5m + 1m]",
+            "foo[step() * 2]",
+            "foo[(9m30s + 30s) * 3]",
+            "foo[min(step(), 1h):max(1s, -5s)]",
+            "foo offset (2 * 2)",
+            "foo[1m] offset -min(step(), 1s)",
+        ] {
+            let e = parse_all(q).unwrap();
+            assert_eq!(parse_all(&e.to_string()).unwrap(), e, "{q} -> {e}");
+        }
     }
 }

@@ -66,19 +66,33 @@ pub fn unquote_string(s: &str) -> Result<String, String> {
         return Ok(inner.to_string());
     }
 
-    let mut res = String::with_capacity(3 * inner.len() / 2);
+    // `\xNN` and `\NNN` are single bytes, as in Go: `"\xc3\xa9"` is "é".
+    // A string whose bytes are not valid UTF-8 (`"\xff"`) is refused: Go
+    // keeps it, and Prometheus then refuses it as a label name or value.
+    let mut res: Vec<u8> = Vec::with_capacity(3 * inner.len() / 2);
     let mut rest = inner;
 
     while !rest.is_empty() {
         let (c, tail) = unquote_char(rest, quote)?;
-        res.push(c);
+        match c {
+            Unquoted::Char(c) => {
+                let mut buf = [0u8; 4];
+                res.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Unquoted::Byte(b) => res.push(b),
+        }
         rest = tail;
     }
 
-    Ok(res)
+    String::from_utf8(res).map_err(|_| format!("invalid UTF-8 in string literal {s}"))
 }
 
-fn unquote_char(s: &str, quote: u8) -> Result<(char, &str), String> {
+enum Unquoted {
+    Char(char),
+    Byte(u8),
+}
+
+fn unquote_char(s: &str, quote: u8) -> Result<(Unquoted, &str), String> {
     let bytes = s.as_bytes();
     let c = bytes[0];
 
@@ -89,12 +103,12 @@ fn unquote_char(s: &str, quote: u8) -> Result<(char, &str), String> {
 
     if c < 0x80 {
         if c != b'\\' {
-            return Ok((c as char, &s[1..]));
+            return Ok((Unquoted::Char(c as char), &s[1..]));
         }
     } else {
         // Handle multi-byte UTF-8 character
         let r = s.chars().next().unwrap();
-        return Ok((r, &s[r.len_utf8()..]));
+        return Ok((Unquoted::Char(r), &s[r.len_utf8()..]));
     }
 
     // Hard case: backslash
@@ -134,7 +148,7 @@ fn unquote_char(s: &str, quote: u8) -> Result<(char, &str), String> {
             tail = &tail[n..];
 
             if c == b'x' {
-                std::char::from_u32(v).ok_or("invalid syntax")?
+                return Ok((Unquoted::Byte(v as u8), tail));
             } else {
                 if v > 0x10FFFF {
                     return Err("invalid syntax".to_string());
@@ -157,7 +171,7 @@ fn unquote_char(s: &str, quote: u8) -> Result<(char, &str), String> {
             if v > 255 {
                 return Err("invalid syntax".to_string());
             }
-            std::char::from_u32(v).ok_or("invalid syntax")?
+            return Ok((Unquoted::Byte(v as u8), tail));
         }
         b'\\' => '\\',
         b'\'' | b'"' => {
@@ -169,7 +183,7 @@ fn unquote_char(s: &str, quote: u8) -> Result<(char, &str), String> {
         _ => return Err("invalid syntax".to_string()),
     };
 
-    Ok((value, tail))
+    Ok((Unquoted::Char(value), tail))
 }
 
 fn unhex(b: u8) -> Result<u32, String> {
@@ -257,6 +271,12 @@ mod tests {
         assert_eq!(unquote_string(r#""\x41""#).unwrap(), "A");
         assert_eq!(unquote_string(r#""\x61""#).unwrap(), "a");
         assert_eq!(unquote_string(r#""\x20""#).unwrap(), " ");
+        // Bytes, as in Go: two escapes form one UTF-8 character, and bytes
+        // that are not UTF-8 are refused.
+        assert_eq!(unquote_string(r#""\xc3\xa9""#).unwrap(), "é");
+        assert_eq!(unquote_string(r#""\303\251""#).unwrap(), "é");
+        assert!(unquote_string(r#""\xff""#).is_err());
+        assert!(unquote_string(r#""a\xc5z""#).is_err());
 
         // Test multiple hex escapes
         assert_eq!(

@@ -21,6 +21,7 @@
 //! parameters like "start"/"end" time or "step" time etc, which is included in [`EvalStmt`].
 
 pub mod ast;
+pub mod duration_expr;
 pub mod function;
 pub mod lex;
 pub mod parse;
@@ -33,9 +34,10 @@ pub use ast::{
     LabelModifier, MatrixSelector, NumberLiteral, Offset, ParenExpr, StringLiteral, SubqueryExpr,
     UnaryExpr, VectorMatchCardinality, VectorMatchFillValues, VectorSelector,
 };
+pub use duration_expr::DurationExpr;
 pub use function::{clear_extra_functions, register_extra_functions, Function, FunctionArgs};
 pub use lex::lexer;
-pub use parse::parse;
+pub use parse::{parse, parse_with_options, ParseOptions};
 
 // FIXME: show more helpful error message to some invalid promql queries.
 const INVALID_QUERY_INFO: &str = "invalid promql query";

@@ -121,7 +121,6 @@ START_METRIC_SELECTOR
 %expect-unused 'KEYWORDS_START' 'KEYWORDS_END' 'PREPROCESSOR_START' 'PREPROCESSOR_END'
 %expect-unused 'STEP' 'STARTSYMBOLS_START'
 %expect-unused 'START_METRIC' 'START_SERIES_DESCRIPTION' 'START_EXPRESSION' 'START_METRIC_SELECTOR' 'STARTSYMBOLS_END'
-%expect-unused 'SMOOTHED' 'ANCHORED'
 
 %expect 5
 
@@ -136,7 +135,7 @@ START_METRIC_SELECTOR
 %right POW
 
 // Offset and At modifiers do not have associativity.
-%nonassoc OFFSET AT GROUP_LEFT GROUP_RIGHT
+%nonassoc OFFSET AT GROUP_LEFT GROUP_RIGHT ANCHORED SMOOTHED
 
 // This ensures that it is always attempted to parse range or subquery selectors when a left
 // bracket is encountered.
@@ -162,6 +161,7 @@ expr -> Result<Expr, String>:
         |       matrix_selector { check_ast($1?) }
         |       number_literal { check_ast($1?) }
         |       offset_expr { check_ast($1?) }
+        |       extended_range_expr { check_ast($1?) }
         |       paren_expr { check_ast($1?) }
         |       string_literal { check_ast($1?) }
         |       subquery_expr { check_ast($1?) }
@@ -388,10 +388,16 @@ paren_expr -> Result<Expr, String>:
  * Offset modifiers.
  */
 offset_expr -> Result<Expr, String>:
-                expr OFFSET duration { $1?.offset_expr(Offset::Pos($3?)) }
-        |       expr OFFSET ADD duration { $1?.offset_expr(Offset::Pos($4?)) }
-        |       expr OFFSET SUB duration { $1?.offset_expr(Offset::Neg($4?)) }
+                expr OFFSET offset_duration { $1?.offset_duration_expr($3?) }
         |       expr OFFSET EOF { Err("unexpected end of input in offset, expected duration".into()) }
+;
+
+/*
+ * Anchored and smoothed modifiers (experimental in Prometheus).
+ */
+extended_range_expr -> Result<Expr, String>:
+                expr ANCHORED { $1?.extended_range_expr(false) }
+        |       expr SMOOTHED { $1?.extended_range_expr(true) }
 ;
 
 /*
@@ -427,9 +433,9 @@ at_modifier_preprocessors -> Result<Token, String>:
  * Subquery and range selectors.
  */
 matrix_selector -> Result<Expr, String>:
-                expr LEFT_BRACKET duration RIGHT_BRACKET
+                expr LEFT_BRACKET duration_expr RIGHT_BRACKET
                 {
-                        Expr::new_matrix_selector($1?, $3?)
+                        Expr::new_matrix_selector_duration_expr($1?, $3?)
                 }
         |       expr LEFT_BRACKET RIGHT_BRACKET
                 {
@@ -438,9 +444,9 @@ matrix_selector -> Result<Expr, String>:
 ;
 
 subquery_expr -> Result<Expr, String>:
-                expr LEFT_BRACKET duration COLON maybe_duration RIGHT_BRACKET
+                expr LEFT_BRACKET duration_expr COLON maybe_duration_expr RIGHT_BRACKET
                 {
-                        Expr::new_subquery_expr($1?, $3?, $5?)
+                        Expr::new_subquery_duration_expr($1?, $3?, $5?)
                 }
 ;
 
@@ -585,6 +591,8 @@ metric_identifier -> Result<Token, String>:
         |       WITHOUT { lexeme_to_token($lexer, $1) }
         |       START { lexeme_to_token($lexer, $1) }
         |       END { lexeme_to_token($lexer, $1) }
+        |       ANCHORED { lexeme_to_token($lexer, $1) }
+        |       SMOOTHED { lexeme_to_token($lexer, $1) }
 ;
 
 /*
@@ -647,6 +655,8 @@ maybe_label -> Result<Token, String>:
         |       START { lexeme_to_token($lexer, $1) }
         |       END { lexeme_to_token($lexer, $1) }
         |       ATAN2 { lexeme_to_token($lexer, $1) }
+        |       ANCHORED { lexeme_to_token($lexer, $1) }
+        |       SMOOTHED { lexeme_to_token($lexer, $1) }
 ;
 
 match_op -> Result<Token, String>:
@@ -683,33 +693,80 @@ string_identifier -> Result<String, String>:
                 }
 ;
 
-duration -> Result<Duration, String>:
-                DURATION { parse_duration($lexer.span_str($span)) }
-        |       NUMBER
+/*
+ * Durations and duration expressions (`5m`, `5m + 1m`, `step() * 2`,
+ * `min(step(), 1m)`). Anything but a plain literal is refused after parsing
+ * unless ParseOptions::duration_expr is set.
+ */
+duration_literal -> Result<DurationExpr, String>:
+                DURATION { Ok(DurationExpr::Duration(parse_duration($lexer.span_str($span))?)) }
+        |       NUMBER { Ok(DurationExpr::Number(parse_str_radix($lexer.span_str($span))?)) }
+;
+
+duration_call -> Result<DurationExpr, String>:
+                IDENTIFIER LEFT_PAREN RIGHT_PAREN
                 {
-                        let num = parse_str_radix($lexer.span_str($span))?;
-                        Ok(Duration::from_secs_f64(num))
+                        let name = lexeme_to_string($lexer, &$1)?;
+                        if name.eq_ignore_ascii_case("step") {
+                            Ok(DurationExpr::Step)
+                        } else {
+                            Err(format!("unexpected function '{name}' in duration expression, expected step(), min() or max()"))
+                        }
                 }
+        |       MIN LEFT_PAREN duration_expr COMMA duration_expr RIGHT_PAREN
+                { Ok(DurationExpr::Min(Box::new($3?), Box::new($5?))) }
+        |       MAX LEFT_PAREN duration_expr COMMA duration_expr RIGHT_PAREN
+                { Ok(DurationExpr::Max(Box::new($3?), Box::new($5?))) }
+;
+
+duration_expr -> Result<DurationExpr, String>:
+                duration_literal { $1 }
+        |       duration_call { $1 }
+        |       LEFT_PAREN duration_expr RIGHT_PAREN { Ok(DurationExpr::Paren(Box::new($2?))) }
+        |       ADD duration_expr %prec MUL { $2 }
+        |       SUB duration_expr %prec MUL { Ok(DurationExpr::Neg(Box::new($2?))) }
+        |       duration_expr ADD duration_expr { Ok(DurationExpr::binary(T_ADD, $1?, $3?)) }
+        |       duration_expr SUB duration_expr { Ok(DurationExpr::binary(T_SUB, $1?, $3?)) }
+        |       duration_expr MUL duration_expr { Ok(DurationExpr::binary(T_MUL, $1?, $3?)) }
+        |       duration_expr DIV duration_expr { Ok(DurationExpr::binary(T_DIV, $1?, $3?)) }
+        |       duration_expr MOD duration_expr { Ok(DurationExpr::binary(T_MOD, $1?, $3?)) }
+        |       duration_expr POW duration_expr { Ok(DurationExpr::binary(T_POW, $1?, $3?)) }
+;
+
+/*
+ * An offset binds tighter than any binary operator: `foo offset 1m + 2` is
+ * `(foo offset 1m) + 2`, so only a signed literal, call or parenthesized
+ * expression follows `offset` (as Prometheus's offset_duration_expr).
+ */
+offset_term -> Result<DurationExpr, String>:
+                duration_literal { $1 }
+        |       duration_call { $1 }
+        |       LEFT_PAREN duration_expr RIGHT_PAREN { Ok(DurationExpr::Paren(Box::new($2?))) }
+;
+
+offset_duration -> Result<DurationExpr, String>:
+                offset_term { $1 }
+        |       ADD offset_term { $2 }
+        |       SUB offset_term { Ok(DurationExpr::Neg(Box::new($2?))) }
 ;
 
 /*
  * Wrappers for optional arguments.
  */
-maybe_duration -> Result<Option<Duration>, String>:
+maybe_duration_expr -> Result<Option<DurationExpr>, String>:
                 { Ok(None) }
-        |       duration { $1.map(Some) }
+        |       duration_expr { $1.map(Some) }
 ;
 
 %%
 
-use std::time::Duration;
 use crate::label::{Labels, Matcher, Matchers};
-use crate::parser::{AtModifier, BinModifier, Expr, FunctionArgs, LabelModifier, Offset, VectorMatchCardinality, VectorMatchFillValues};
+use crate::parser::{AtModifier, BinModifier, DurationExpr, Expr, FunctionArgs, LabelModifier, VectorMatchCardinality, VectorMatchFillValues};
 use crate::parser::ast::check_ast;
 use crate::parser::function::get_function;
 use crate::parser::lex::is_label;
 use crate::parser::production::{lexeme_to_string, lexeme_to_token, span_to_string};
-use crate::parser::token::{Token, T_IDENTIFIER};
+use crate::parser::token::{Token, T_ADD, T_DIV, T_IDENTIFIER, T_MOD, T_MUL, T_POW, T_SUB};
 use crate::util::{parse_duration, parse_str_radix, unquote_string};
 
 fn update_optional_matching(

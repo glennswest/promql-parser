@@ -65,6 +65,7 @@ struct Context {
     brace_open: bool,   // Whether a { is opened.
     bracket_open: bool, // Whether a [ is opened.
     got_colon: bool,    // Whether we got a ':' after [ was opened.
+    bracket_paren_depth: usize, // Nesting depth of ( ) inside [ ] (duration expressions).
     eof: bool,          // Whether we got end of file
 }
 
@@ -80,6 +81,7 @@ impl Context {
             brace_open: false,
             bracket_open: false,
             got_colon: false,
+            bracket_paren_depth: 0,
             eof: false,
         }
     }
@@ -654,14 +656,55 @@ impl Lexer {
                 State::Lexeme(T_COLON)
             }
             Some(ch) if ch.is_ascii_digit() => self.accept_number_or_duration(),
+            Some('.') if matches!(self.peek(), Some(ch) if ch.is_ascii_digit()) => {
+                self.accept_number_or_duration()
+            }
             Some(']') => {
+                if self.ctx.bracket_paren_depth != 0 {
+                    return State::Err("unclosed left parenthesis in brackets".into());
+                }
                 self.jump_outof_brackets();
                 self.reset_colon_scanned();
                 State::Lexeme(T_RIGHT_BRACKET)
             }
+            // Duration expressions: `[5m + 1m]`, `[step() * 2]`, `[min(1h, step())]`.
+            Some('(') => {
+                self.ctx.bracket_paren_depth += 1;
+                State::Lexeme(T_LEFT_PAREN)
+            }
+            Some(')') => {
+                if self.ctx.bracket_paren_depth == 0 {
+                    return State::Err("unexpected right parenthesis ')' inside brackets".into());
+                }
+                self.ctx.bracket_paren_depth -= 1;
+                State::Lexeme(T_RIGHT_PAREN)
+            }
+            Some('+') => State::Lexeme(T_ADD),
+            Some('-') => State::Lexeme(T_SUB),
+            Some('*') => State::Lexeme(T_MUL),
+            Some('/') => State::Lexeme(T_DIV),
+            Some('%') => State::Lexeme(T_MOD),
+            Some('^') => State::Lexeme(T_POW),
+            Some(',') => State::Lexeme(T_COMMA),
+            Some(ch) if is_alpha(ch) => self.accept_duration_keyword(),
             Some('[') => State::Err("unexpected left brace '[' inside brackets".into()),
             Some(ch) => State::Err(format!("unexpected character inside brackets: '{ch}'")),
             None => State::Err("unexpected end of input inside brackets".into()),
+        }
+    }
+
+    /// A word inside brackets: only `step`, `min` and `max` (any case) may
+    /// appear in a duration expression. The first letter has been consumed.
+    fn accept_duration_keyword(&mut self) -> State {
+        self.accept_run(is_alpha_numeric);
+        let word = self.lexeme_string();
+        match word.to_lowercase().as_str() {
+            "step" => State::Lexeme(T_IDENTIFIER),
+            "min" => State::Lexeme(T_MIN),
+            "max" => State::Lexeme(T_MAX),
+            _ => State::Err(format!(
+                "unexpected '{word}' inside brackets, expected a duration, step(), min() or max()"
+            )),
         }
     }
 
