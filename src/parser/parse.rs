@@ -2622,7 +2622,6 @@ mod tests {
             "foo[2m*15]",
             "foo[2m*(10+5)]",
             "foo[29m+60s]",
-            "foo[24m+((1.5*2m)+2m)]",
             "foo[-5m+35m]",
             "foo[1h/2]",
             "foo[1h30m % 1h]",
@@ -2633,6 +2632,7 @@ mod tests {
             let e = parse_all(q).unwrap_or_else(|err| panic!("{q}: {err}"));
             assert_eq!(range_secs(&e), 1800.0, "{q}");
         }
+        assert_eq!(range_secs(&parse_all("foo[24m+((1.5*2m)+2m)]").unwrap()), 1740.0);
         // A plain literal is not an expression.
         match parse_all("foo[30m]").unwrap() {
             Expr::MatrixSelector(ms) => assert!(ms.range_expr.is_none()),
