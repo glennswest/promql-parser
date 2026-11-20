@@ -1728,6 +1728,7 @@ impl Prettier for Expr {
 /// expression, resolved later.
 fn range_literal(e: DurationExpr) -> Result<(Duration, Option<DurationExpr>), String> {
     match e {
+        DurationExpr::Duration(d) if d.is_zero() => Err("duration must be greater than 0".into()),
         DurationExpr::Duration(d) => Ok((d, None)),
         DurationExpr::Number(n) if n.is_finite() && n > 0.0 => {
             Ok((Duration::from_secs_f64(n), None))

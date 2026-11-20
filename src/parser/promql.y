@@ -699,7 +699,16 @@ string_identifier -> Result<String, String>:
  * unless ParseOptions::duration_expr is set.
  */
 duration_literal -> Result<DurationExpr, String>:
-                DURATION { Ok(DurationExpr::Duration(parse_duration($lexer.span_str($span))?)) }
+                DURATION
+                {
+                        // A zero duration is a valid term (`5m + 0s`); a range,
+                        // step or offset is checked when it is built.
+                        match parse_duration($lexer.span_str($span)) {
+                            Ok(d) => Ok(DurationExpr::Duration(d)),
+                            Err(e) if e == "duration must be greater than 0" => Ok(DurationExpr::Duration(Duration::ZERO)),
+                            Err(e) => Err(e),
+                        }
+                }
         |       NUMBER { Ok(DurationExpr::Number(parse_str_radix($lexer.span_str($span))?)) }
 ;
 
@@ -760,6 +769,7 @@ maybe_duration_expr -> Result<Option<DurationExpr>, String>:
 
 %%
 
+use std::time::Duration;
 use crate::label::{Labels, Matcher, Matchers};
 use crate::parser::{AtModifier, BinModifier, DurationExpr, Expr, FunctionArgs, LabelModifier, VectorMatchCardinality, VectorMatchFillValues};
 use crate::parser::ast::check_ast;

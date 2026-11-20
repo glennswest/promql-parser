@@ -49,13 +49,11 @@ pub fn parse(input: &str) -> Result<Expr, String> {
 /// keep a zero value until [`Expr::resolve_durations`] is called with the
 /// query's step.
 pub fn parse_with_options(input: &str, opts: &ParseOptions) -> Result<Expr, String> {
-    let mut expr = match lex::lexer(input) {
-        Err(e) => return Err(e),
-        Ok(lexer) => {
-            // NOTE: the errs is ignored so far.
-            let (res, _errs) = crate::promql_y::parse(&lexer);
-            res.ok_or_else(|| String::from(INVALID_QUERY_INFO))??
-        }
+    let mut expr = {
+        let lexer = lex::lexer(input)?;
+        // NOTE: the errs is ignored so far.
+        let (res, _errs) = crate::promql_y::parse(&lexer);
+        res.ok_or_else(|| String::from(INVALID_QUERY_INFO))??
     };
     check_options(&expr, opts)?;
     expr.resolve_durations_inner(None)?;
@@ -213,11 +211,11 @@ mod tests {
             ),
             // \a is not valid character in rust, use \u{7} instead
             (
-                r#""\a\b\f\n\r\t\v\\\" - \xFF\377\u1234\U00010111\U0001011111☺""#,
+                r#""\a\b\f\n\r\t\v\\\" - \xc3\xbf\303\277\u1234\U00010111\U0001011111☺""#,
                 Expr::from("\u{7}\u{8}\u{c}\n\r\t\u{b}\\\" - ÿÿሴ𐄑𐄑11☺"),
             ),
             (
-                r"'\a\b\f\n\r\t\v\\\' - \xFF\377\u1234\U00010111\U0001011111☺'",
+                r"'\a\b\f\n\r\t\v\\\' - \xc3\xbf\303\277\u1234\U00010111\U0001011111☺'",
                 Expr::from("\u{7}\u{8}\u{c}\n\r\t\u{b}\\' - ÿÿሴ𐄑𐄑11☺"),
             ),
             // no escape in ` quoted string
@@ -233,6 +231,8 @@ mod tests {
             (r#""\"#, "escape sequence not terminated"),
             (r#""\c""#, "unknown escape sequence 'c'"),
             // (r#""\x.""#, ""),
+            // Bytes that are not UTF-8 (Go keeps them; a Rust String cannot).
+            (r#""\xFF\377""#, r#"invalid UTF-8 in string literal "\xFF\377""#),
         ];
         assert_cases(Case::new_fail_cases(fail_cases));
     }
